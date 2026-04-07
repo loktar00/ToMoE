@@ -657,9 +657,12 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = Qwen3_5TextModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Qwen 3.5 uses a multimodal config; extract text_config
+        text_config = getattr(config, "text_config", config)
+        self.model = Qwen3_5TextModel(text_config)
+        self.vocab_size = text_config.vocab_size
+        self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
+        self.text_config = text_config
 
         self.post_init()
 
@@ -720,7 +723,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_logits = shift_logits.view(-1, self.text_config.vocab_size)
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
