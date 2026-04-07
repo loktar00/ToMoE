@@ -212,6 +212,148 @@ class collect_info_reg_llama(nn.Module):
 
         return self.lam * loss
 
+class collect_info_reg_qwen3_5(nn.Module):
+    """Parameter regularization for Qwen 3.5 hybrid architecture.
+
+    Walks the model to find virtual operations. For Qwen 3.5:
+    - 32 MLP entries (all layers)
+    - 8 attention entries (full-attention layers only, every 4th)
+    - GDN layers contribute MLP only (no attention virtual ops)
+    - Structure list: 40 entries in depth-first order
+    """
+    def __init__(self, model, p=None, lam=4.0, factor=0.7):
+        super(collect_info_reg_qwen3_5, self).__init__()
+        self.sum_ori_params = 0
+        self.p = p
+        self.constant_p = factor * self.p
+        self.in_dim_list = []
+        self.out_dim_list = []
+        self.num_w_list = []
+        self.structures = []
+        self.gate_type = []
+        self.lam = lam
+        self.model_dim = None
+        print(self.gate_type)
+
+        modules = list(model.modules())
+        for layer_id in range(len(modules)):
+            m = modules[layer_id]
+            if type(m).__name__ == 'virtual_block_basic_operation':
+                if self.model_dim is None:
+                    self.model_dim = m.dim
+                self.in_dim_list.append(None)
+                self.out_dim_list.append(None)
+                self.num_w_list.append(None)
+                self.gate_type.append('mlp_block')
+            if type(m).__name__ == 'virtual_mlp_operation':
+                ori_param = m.get_parameters()
+                self.sum_ori_params += ori_param
+                self.in_dim_list.append(m.ex_dict['dim_1'])
+                self.out_dim_list.append(m.ex_dict['dim_2'])
+                self.num_w_list.append(m.ex_dict['num_weight'])
+                self.structures.append(m.dim)
+                self.gate_type.append('mlp')
+            if type(m).__name__ == 'virtual_vo_operation':
+                self.in_dim_list.append(m.ex_dict['dim_1'])
+                self.out_dim_list.append(m.ex_dict['dim_2'])
+                self.num_groups = m.ex_dict['num_groups']
+                self.head_dim = m.ex_dict['head_dim']
+                self.num_heads = m.ex_dict['num_heads']
+                self.num_kv_heads = m.ex_dict['num_kv_heads']
+                self.structures.append(m.dim)
+                self.gate_type.append('attn')
+            if type(m).__name__ == 'virtual_block_attn_operation':
+                if self.model_dim is None:
+                    self.model_dim = m.dim
+                ori_param = m.get_parameters()
+                self.sum_ori_params += ori_param
+                self.in_dim_list.append(m.ex_dict['dim_1'])
+                self.out_dim_list.append(m.ex_dict['dim_2'])
+                self.num_w_list.append(m.ex_dict['num_weight'])
+                self.num_groups = m.ex_dict['num_groups']
+                self.head_dim = m.ex_dict['head_dim']
+                self.gate_type.append('attn_block')
+            if type(m).__name__ == 'virtual_basic_operation':
+                if self.model_dim is None:
+                    self.model_dim = m.dim
+                self.in_dim_list.append(None)
+                self.out_dim_list.append(None)
+                self.num_w_list.append(None)
+                self.gate_type.append('basic_gate')
+
+        print("number of original parameters: %.3f" % (self.sum_ori_params / 10 ** 6))
+        print(self.gate_type)
+
+    def count_current_params(self, vectors):
+        print("number of heads: %.1f" % (self.num_heads))
+        print("number of kv heads: %.1f" % (self.num_kv_heads))
+        print("model dim: %.1f" % (self.model_dim))
+        with torch.no_grad():
+            sum_params = 0
+            i = 0
+            ind = 0
+            model_dim = self.model_dim
+            while i < len(self.out_dim_list):
+                if self.gate_type[i] == 'attn':
+                    if isinstance(vectors[ind], list):
+                        # Qwen 3.5 attention: q_proj doubled for gate
+                        reg_heads = model_dim * self.num_heads * vectors[ind][1] + model_dim * self.num_heads * vectors[ind][0]
+                        kv_heads = model_dim * self.num_kv_heads * vectors[ind][1] + model_dim * self.num_kv_heads * vectors[ind][0]
+                        current_params = reg_heads + kv_heads
+                    else:
+                        current_params = model_dim * 2 * vectors[ind] * self.head_dim + model_dim * 2 * vectors[ind] * self.head_dim * self.num_groups
+                    i += 1
+                    ind += 1
+                    sum_params += current_params
+                elif self.gate_type[i] == 'mlp':
+                    block_mlp_in_dim = model_dim
+                    block_mlp_middle_dim = vectors[ind]
+                    block_mlp_out_dim = model_dim
+                    current_params = block_mlp_in_dim * block_mlp_middle_dim + block_mlp_in_dim * block_mlp_middle_dim + block_mlp_middle_dim * block_mlp_out_dim
+                    i += 1
+                    ind += 1
+                    sum_params += current_params
+                else:
+                    i += 1
+            print("current parameters: %.3f" % (sum_params / 10 ** 6))
+            return sum_params
+
+    def forward(self, vectors):
+        sum_params = 0
+        np_sum_params = 0
+        i = 0
+        ind = 0
+        model_dim = self.model_dim
+        while i < len(self.out_dim_list):
+            if self.gate_type[i] == 'attn':
+                reg_heads = model_dim * self.num_heads * vectors[ind][1] + model_dim * self.num_heads * vectors[ind][0]
+                kv_heads = model_dim * self.num_kv_heads * vectors[ind][1] + model_dim * self.num_kv_heads * vectors[ind][0]
+                current_params = reg_heads + kv_heads
+                ind += 1
+                i += 1
+                sum_params += current_params
+            elif self.gate_type[i] == 'mlp':
+                block_mlp_in_dim = model_dim
+                block_mlp_middle_dim = vectors[ind]
+                block_mlp_out_dim = model_dim
+                current_params = block_mlp_in_dim * block_mlp_middle_dim + block_mlp_in_dim * block_mlp_middle_dim + block_mlp_middle_dim * block_mlp_out_dim
+                i += 1
+                ind += 1
+                if not torch.is_tensor(sum_params):
+                    sum_params = torch.as_tensor(sum_params, device=current_params.device, dtype=current_params.dtype)
+                if sum_params.ndim == 0:
+                    sum_params = sum_params.expand_as(current_params).clone()
+                sum_params += current_params
+            else:
+                i += 1
+        param_ratio = sum_params / (self.sum_ori_params - np_sum_params)
+        corrected_p = (self.sum_ori_params * self.p - np_sum_params) / (self.sum_ori_params - np_sum_params)
+        if not torch.is_tensor(corrected_p):
+            corrected_p = torch.as_tensor(corrected_p, device=current_params.device, dtype=current_params.dtype)
+        loss = minmax_reg_loss(param_ratio, corrected_p, c=0.001)
+        return self.lam * loss
+
+
 class collect_info_reg_phi(nn.Module):
     def __init__(self, model, p=None, lam=4.0, factor=0.7):
         super(collect_info_reg_phi, self).__init__()
@@ -580,7 +722,9 @@ class help_functions_hn(nn.Module):
                 m.apply_qk_gate = flag
             if type(m).__name__ == 'LlamaSdpaAttention' or type(m).__name__ == 'LlamaFlashAttention2' or type(m).__name__ == 'LlamaAttention':
                 m.apply_qk_gate = flag
-    
+            if type(m).__name__ == 'Qwen3_5Attention':
+                m.apply_qk_gate = flag
+
     def set_qk_hyperparameters(self, model, qk_sample_rate = 0.6, grad_w=2.0, pv_detach_flag=False, block_dropout=0.1):
         modules = list(model.modules())
         for layer_id in range(len(modules)):
@@ -593,8 +737,13 @@ class help_functions_hn(nn.Module):
                 m.qk_sample_rate = qk_sample_rate
                 m.grad_w = grad_w
                 m.pv_detach_flag = pv_detach_flag
-            if type(m).__name__ == 'LlamaDecoderLayer':
-                m.resid_dropout.p = block_dropout
+            if type(m).__name__ == 'Qwen3_5Attention':
+                m.qk_sample_rate = qk_sample_rate
+                m.grad_w = grad_w
+                m.pv_detach_flag = pv_detach_flag
+            if type(m).__name__ == 'LlamaDecoderLayer' or type(m).__name__ == 'Qwen3_5DecoderLayer':
+                if hasattr(m, 'resid_dropout'):
+                    m.resid_dropout.p = block_dropout
 
     def assign_width(self, model, width_list, num_heads=32):
         modules = list(model.modules())

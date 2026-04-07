@@ -166,23 +166,22 @@ def main(
     tokenizer = hf_tokenizer
     ignored_token = tokenizer.bos_token_id #EasyLM ignore bos in
 
-    from tomoe.pruning_helper import help_functions_hn, collect_info_reg_phi, collect_info_reg_llama
+    from tomoe.pruning_helper import help_functions_hn, collect_info_reg_phi, collect_info_reg_llama, collect_info_reg_qwen3_5
     from tomoe.hypernetwork import hypernetwork, experts_module_list, single_experts_module, hn_module_list
 
-    # wait for Qwen Implementation 
+    # Qwen 3.5 support
+    if "Qwen3.5" in hf_model or "Qwen3_5" in hf_model:
+        from models.modeling_qwen3_5_dpmoe import Qwen3_5ForCausalLM, Qwen3_5DecoderLayer
 
-    # if hf_model == "Qwen/Qwen2.5-7B" or hf_model == "Qwen/Qwen2.5-14B":
-    #     from models.modeling_qwen2_dpmoe import Qwen2ForCausalLM, Qwen2DecoderLayer
+        model = Qwen3_5ForCausalLM.from_pretrained(
+            hf_model,
+            torch_dtype=data_type,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
+        ignored_token = tokenizer.eos_token_id
+        PruneLlamaDecoderLayer = Qwen3_5DecoderLayer
 
-    #     model = Qwen2ForCausalLM.from_pretrained(hf_model, attn_implementation = "flash_attention_2",torch_dtype=torch.bfloat16, device_map=device_id)
-
-    #     tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
-    #     ignored_token_value = '<|endoftext|>'
-    #     ignored_token = tokenizer(ignored_token_value)['input_ids'][0]
-    #     print(ignored_token)
-    #     PruneLlamaDecoderLayer = Qwen2DecoderLayer
-
-    if hf_model == "meta-llama/Llama-2-7b-hf" or hf_model == "meta-llama/Llama-2-13b-hf" or hf_model == 'meta-llama/Meta-Llama-3-8B':
+    elif hf_model == "meta-llama/Llama-2-7b-hf" or hf_model == "meta-llama/Llama-2-13b-hf" or hf_model == 'meta-llama/Meta-Llama-3-8B':
 
         from models.modeling_llama_dpmoe import LlamaForCausalLM, LlamaDecoderLayer
         # model_dtype = torch.bfloat16 if use_bf16 else torch.float32
@@ -227,7 +226,10 @@ def main(
     toc = time.time() - tic
     env.print(f"Initialilzing training dataset - done. Time elapse (s): {toc:.2f}")
     
-    param_reg = collect_info_reg_llama(model, p = p,lam = lam)
+    if "Qwen3.5" in hf_model or "Qwen3_5" in hf_model:
+        param_reg = collect_info_reg_qwen3_5(model, p=p, lam=lam)
+    else:
+        param_reg = collect_info_reg_llama(model, p=p, lam=lam)
         
 
     rnn = hypernetwork(t_structures = param_reg.structures, experts=dynamic_experts)

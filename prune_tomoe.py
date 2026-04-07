@@ -12,7 +12,7 @@ from models.modeling_llama_moe_final import (
     single_experts_module,
 )
 from tomoe.hypernetwork import experts_module_list, hypernetwork
-from tomoe.pruning_helper import collect_info_reg_llama, help_functions_hn
+from tomoe.pruning_helper import collect_info_reg_llama, collect_info_reg_qwen3_5, help_functions_hn
 from utils.unwrap import unwrap_model
 
 
@@ -75,17 +75,23 @@ def load_eval_data(dataset_name: str) -> str:
 def write_cfgs(output_dir, vector, hf_model):
     import os
 
+    is_qwen = "Qwen3.5" in hf_model or "Qwen3_5" in hf_model
     supported = {
         "dfurman/LLaMA-13B",
         "meta-llama/Llama-2-7b-hf",
         "meta-llama/Llama-2-13b-hf",
         "lmsys/vicuna-7b-v1.3",
         "meta-llama/Meta-Llama-3-8B",
+        "Qwen/Qwen3.5-9B",
     }
-    if hf_model not in supported:
+    if hf_model not in supported and not is_qwen:
         raise ValueError(f"write_cfgs: unsupported hf_model: {hf_model}")
 
-    target_path = os.path.join(output_dir, "modeling_llama_moe_final.py")
+    if is_qwen:
+        target_filename = "modeling_qwen3_5_moe_final.py"
+    else:
+        target_filename = "modeling_llama_moe_final.py"
+    target_path = os.path.join(output_dir, target_filename)
     if not os.path.exists(target_path):
         raise FileNotFoundError(f"write_cfgs: missing file: {target_path}")
 
@@ -231,6 +237,121 @@ def convert_to_moe_llama(model, truncated_union_list, hn, dynamic_experts, attn_
     return model
 
 
+def convert_to_moe_qwen3_5(model, truncated_union_list, hn, dynamic_experts, attn_prune=False):
+    """Convert Qwen 3.5 dense model to MoE using trained hypernetwork.
+
+    - MLP conversion on all 32 layers
+    - Attention pruning only on 8 full-attention layers (Qwen3_5Attention)
+    - GDN layers (Qwen3_5GatedDeltaNet) are skipped entirely
+    """
+    from models.modeling_qwen3_5_moe_final import single_experts_module as qwen_experts_module
+
+    cfgs = []
+    device = next(model.parameters()).device
+
+    mlp_index = 0
+    moe_index = 0
+    modules = list(model.modules())
+    for m in modules:
+        # Full attention layers only (skip GDN)
+        if type(m).__name__ == "Qwen3_5Attention":
+            attn_vector = hn[1].module_list[moe_index].experts_for_eval
+
+            expert_module = qwen_experts_module(
+                m.head_dim,
+                m.hidden_size,
+                head_dim=m.head_dim,
+                attn_flag=True,
+                experts=dynamic_experts,
+            )
+
+            expert_weight = hn[1].module_list[moe_index].linear_router.weight.data
+            decoder_weight = hn[1].module_list[moe_index].linear_decoder.weight.data[:m.head_dim, :]
+            ln_weight = hn[1].module_list[moe_index].ln.weight.data
+            ln_bias = hn[1].module_list[moe_index].ln.bias.data
+            rnn_state_buffer = hn[1].module_list[moe_index].rnn_state.mean(dim=0)
+
+            expert_module.linear_router.weight.data.copy_(expert_weight)
+            expert_module.linear_decoder.weight.data.copy_(decoder_weight)
+            expert_module.ln.weight.data.copy_(ln_weight)
+            expert_module.ln.bias.data.copy_(ln_bias)
+            expert_module.rnn_state.copy_(rnn_state_buffer)
+
+            if attn_prune and attn_vector is not None:
+                attn_vector = attn_vector.to(device)
+                if attn_vector.ndim != 1 or attn_vector.numel() != m.head_dim:
+                    attn_vector = torch.ones(m.head_dim, dtype=attn_vector.dtype, device=device)
+                select_index = (attn_vector > 0).nonzero().squeeze()
+                if select_index.numel() == 0:
+                    select_index = torch.argmax(attn_vector).view(1)
+                pruned_head_dim = int(select_index.numel())
+
+                # Prune Q (doubled: query + gate)
+                q_weight = m.q_proj.weight.data.view(m.num_heads, m.head_dim * 2, m.hidden_size)
+                q_query = q_weight[:, :m.head_dim, :][:, select_index, :]
+                q_gate = q_weight[:, m.head_dim:, :][:, select_index, :]
+                q_pruned = torch.cat([q_query, q_gate], dim=1)
+                q_proj = torch.nn.Linear(m.hidden_size, m.num_heads * pruned_head_dim * 2, bias=False).to(device)
+                q_proj.weight.data.copy_(q_pruned.reshape(-1, m.hidden_size))
+
+                # Prune K
+                k_weight = m.k_proj.weight.data.view(m.num_key_value_heads, m.head_dim, m.hidden_size)
+                k_pruned = k_weight[:, select_index, :]
+                k_proj = torch.nn.Linear(m.hidden_size, m.num_key_value_heads * pruned_head_dim, bias=False).to(device)
+                k_proj.weight.data.copy_(k_pruned.reshape(-1, m.hidden_size))
+
+                m.q_proj = q_proj
+                m.k_proj = k_proj
+
+                mask = torch.zeros(1, m.head_dim, dtype=torch.uint8, device=device)
+                mask[:, select_index] = 1
+                expert_module.experts_for_eval.copy_(mask)
+                expert_module.register_buffer('qk_index', torch.zeros(int(mask.sum())).to(torch.int64))
+                expert_module.qk_index.copy_(select_index.to(torch.int64))
+
+                m.experts_module = expert_module
+                cfgs.append(pruned_head_dim)
+            else:
+                m.experts_module = expert_module
+                cfgs.append(m.head_dim)
+            moe_index += 1
+
+        # MLP layers (all 32)
+        if type(m).__name__ == "Qwen3_5MLP":
+            mid_vector = truncated_union_list[mlp_index]
+            mid_index = (mid_vector > 0).nonzero(as_tuple=False).view(-1)
+            if mid_index.numel() == 0:
+                mid_index = torch.argmax(mid_vector).view(1)
+            mid_dim = mid_index.numel()
+
+            gate_proj = torch.nn.Linear(m.config.hidden_size, mid_dim, bias=False).to(device)
+            up_proj = torch.nn.Linear(m.config.hidden_size, mid_dim, bias=False).to(device)
+            down_proj = torch.nn.Linear(mid_dim, m.config.hidden_size, bias=False).to(device)
+
+            gate_proj.weight.data.copy_(m.gate_proj.weight.data[mid_index, :])
+            up_proj.weight.data.copy_(m.up_proj.weight.data[mid_index, :])
+            down_proj.weight.data.copy_(m.down_proj.weight.data[:, mid_index])
+
+            m.gate_proj = gate_proj
+            m.up_proj = up_proj
+            m.down_proj = down_proj
+
+            expert_module = qwen_experts_module(mid_dim, m.config.hidden_size, experts=dynamic_experts)
+            expert_weight = hn[1].module_list[moe_index].linear_router.weight.data
+            eval_experts = hn[1].module_list[moe_index].experts_for_eval
+
+            expert_module.linear_router.weight.data.copy_(expert_weight)
+            expert_module.experts_for_eval.copy_(eval_experts[:, mid_index].to(torch.uint8))
+
+            m.experts_module = expert_module
+            cfgs.append(mid_dim)
+            mlp_index += 1
+            moe_index += 1
+
+    model.cfgs = cfgs
+    return model
+
+
 def main(
     hf_model: str = "meta-llama/Llama-2-7b-hf",
     hn_path: str = "hn_path",
@@ -239,17 +360,28 @@ def main(
     attn_prune: bool = False,
     test_model: bool = False,
 ) -> None:
-    if hf_model not in (
+    supported_models = {
         "meta-llama/Llama-2-7b-hf",
         "meta-llama/Llama-2-13b-hf",
         "meta-llama/Meta-Llama-3-8B",
-    ):
+        "Qwen/Qwen3.5-9B",
+    }
+    is_qwen3_5 = "Qwen3.5" in hf_model or "Qwen3_5" in hf_model
+
+    if hf_model not in supported_models and not is_qwen3_5:
         raise ValueError(f"Unsupported hf_model for this repo: {hf_model}")
 
     device_id = "cuda:0"
-    model = LlamaForCausalLM.from_pretrained(hf_model, torch_dtype=torch.bfloat16, device_map=device_id)
-    tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
-    param_reg = collect_info_reg_llama(model, p=0.5, lam=1.0)
+
+    if is_qwen3_5:
+        from models.modeling_qwen3_5_dpmoe import Qwen3_5ForCausalLM
+        model = Qwen3_5ForCausalLM.from_pretrained(hf_model, torch_dtype=torch.bfloat16, device_map=device_id)
+        tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
+        param_reg = collect_info_reg_qwen3_5(model, p=0.5, lam=1.0)
+    else:
+        model = LlamaForCausalLM.from_pretrained(hf_model, torch_dtype=torch.bfloat16, device_map=device_id)
+        tokenizer = AutoTokenizer.from_pretrained(hf_model, trust_remote_code=True)
+        param_reg = collect_info_reg_llama(model, p=0.5, lam=1.0)
 
     rnn = hypernetwork(t_structures=param_reg.structures, experts=dynamic_experts)
     experts_list = experts_module_list(
@@ -301,7 +433,10 @@ def main(
 
     truncated_union_list = [i for i in width_union_list if not isinstance(i, int) and i.sum().item() != 0]
 
-    model = convert_to_moe_llama(model, truncated_union_list, hn, dynamic_experts, attn_prune=attn_prune)
+    if is_qwen3_5:
+        model = convert_to_moe_qwen3_5(model, truncated_union_list, hn, dynamic_experts, attn_prune=attn_prune)
+    else:
+        model = convert_to_moe_llama(model, truncated_union_list, hn, dynamic_experts, attn_prune=attn_prune)
     width_union_cfgs = model.cfgs + [int(dynamic_experts)]
     print(width_union_cfgs)
     state_dict = model.state_dict()
@@ -309,9 +444,15 @@ def main(
 
     torch.cuda.empty_cache()
 
-    LlamaMoEForCausalLM.cfgs = width_union_cfgs
-    moe_model = LlamaMoEForCausalLM(config).to("cuda", dtype=torch.bfloat16)
-    moe_model.load_state_dict(state_dict)
+    if is_qwen3_5:
+        from models.modeling_qwen3_5_moe_final import Qwen3_5ForCausalLM as Qwen3_5MoEForCausalLM
+        Qwen3_5MoEForCausalLM.cfgs = width_union_cfgs
+        moe_model = Qwen3_5MoEForCausalLM(config).to("cuda", dtype=torch.bfloat16)
+        moe_model.load_state_dict(state_dict)
+    else:
+        LlamaMoEForCausalLM.cfgs = width_union_cfgs
+        moe_model = LlamaMoEForCausalLM(config).to("cuda", dtype=torch.bfloat16)
+        moe_model.load_state_dict(state_dict)
     del state_dict
     torch.cuda.empty_cache()
 
@@ -348,6 +489,15 @@ def main(
 
     moe_model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+
+    # Copy the MoE final model file to the output directory for auto-loading
+    import shutil
+    if is_qwen3_5:
+        src_model_file = os.path.join(os.path.dirname(__file__), "models", "modeling_qwen3_5_moe_final.py")
+    else:
+        src_model_file = os.path.join(os.path.dirname(__file__), "models", "modeling_llama_moe_final.py")
+    if os.path.exists(src_model_file):
+        shutil.copy2(src_model_file, output_dir)
     write_cfgs(output_dir, width_union_cfgs, hf_model)
 
 if __name__ == "__main__":
